@@ -1,0 +1,34 @@
+name: Pokepara 100 Likes Check
+
+on:
+  schedule:
+    # 毎日 22:30 (日本時間 JST) に自動実行（UTCでは 13:30）
+    - cron: '30 13 * * *'
+  workflow_dispatch: # GitHub画面からいつでも手動実行も可能
+
+jobs:
+  check-likes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run Pokepara check and send LINE notification
+        env:
+          POKEPARA_ID: ${{ secrets.POKEPARA_ID }}
+          POKEPARA_PASSWORD: ${{ secrets.POKEPARA_PASSWORD }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_TO_ID: ${{ secrets.LINE_TO_ID }}
+        run: python check_pokepara_likes.py
