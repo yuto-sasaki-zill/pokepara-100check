@@ -1,3 +1,4 @@
+
 import os
 import re
 import sys
@@ -10,6 +11,7 @@ from playwright.sync_api import sync_playwright
 POKEPARA_ID = os.environ.get("POKEPARA_ID", "").strip()
 POKEPARA_PASSWORD = os.environ.get("POKEPARA_PASSWORD", "").strip()
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+# カンマ区切りで複数ID指定可能（例: Uxxxx,Uyyyy）または BROADCAST（友だち全員に送信）
 LINE_TO_ID = os.environ.get("LINE_TO_ID", "").strip()
 
 LOGIN_URL = "https://www.pokepara.jp/kyushu/login/login_shopc.aspx"
@@ -35,29 +37,52 @@ def clean_cast_name(name: str) -> str:
 
 
 def send_line_message(text: str) -> None:
-    """LINE Messaging API (Push Message) で結果を通知する"""
-    if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_TO_ID:
+    """LINE Messaging APIで結果を通知する（単一ID / カンマ区切り複数ID / BROADCAST 対応）"""
+    if not LINE_CHANNEL_ACCESS_TOKEN:
         print("LINE認証情報が未設定のため標準出力のみ行います:\n", text, flush=True)
         return
 
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
-        "X-Line-Retry-Key": str(uuid.uuid4()),
-    }
-    payload = {
-        "to": LINE_TO_ID,
-        "messages": [{"type": "text", "text": text[:4999]}],
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code != 200:
-            print(f"LINE送信エラー ({resp.status_code}): {resp.text}", file=sys.stderr, flush=True)
-        else:
-            print("LINE通知を正常に送信しました。", flush=True)
-    except Exception as e:
-        print(f"LINE送信例外エラー: {e}", file=sys.stderr, flush=True)
+    messages_payload = [{"type": "text", "text": text[:4999]}]
+
+    # LINE_TO_ID が未設定または BROADCAST の場合は友だち全員に一斉送信
+    if not LINE_TO_ID or LINE_TO_ID.upper() == "BROADCAST":
+        url = "https://api.line.me/v2/bot/message/broadcast"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "X-Line-Retry-Key": str(uuid.uuid4()),
+        }
+        try:
+            resp = requests.post(url, headers=headers, json={"messages": messages_payload}, timeout=30)
+            if resp.status_code != 200:
+                print(f"LINE Broadcast送信エラー ({resp.status_code}): {resp.text}", file=sys.stderr, flush=True)
+            else:
+                print("LINE Broadcast通知（友だち全員宛）を正常に送信しました。", flush=True)
+        except Exception as e:
+            print(f"LINE送信例外エラー: {e}", file=sys.stderr, flush=True)
+        return
+
+    # カンマまたは改行・空白区切りで複数の送信先IDに対応
+    target_ids = [tid.strip() for tid in re.split(r"[,\s]+", LINE_TO_ID) if tid.strip()]
+    for tid in target_ids:
+        url = "https://api.line.me/v2/bot/message/push"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+            "X-Line-Retry-Key": str(uuid.uuid4()),
+        }
+        payload = {
+            "to": tid,
+            "messages": messages_payload,
+        }
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code != 200:
+                print(f"LINE送信エラー (宛先={tid}, {resp.status_code}): {resp.text}", file=sys.stderr, flush=True)
+            else:
+                print(f"LINE通知を正常に送信しました (宛先={tid})。", flush=True)
+        except Exception as e:
+            print(f"LINE送信例外エラー (宛先={tid}): {e}", file=sys.stderr, flush=True)
 
 
 def safe_goto(page, url: str, timeout: int = 25000) -> bool:
@@ -189,7 +214,6 @@ def extract_remaining_likes(page, blog_url: str) -> int:
 
 
 def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
-    """非表示要素のクリック待機エラーを防ぐため、すべてJavaScriptまたはURL直接遷移で店舗を切り替える"""
     try:
         res = page.evaluate(
             """(keyword) => {
@@ -238,7 +262,6 @@ def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
 
 
 def navigate_to_cast_list(page) -> str:
-    """href を直接取得して『女の子一覧』へ遷移する"""
     for label in ["女の子一覧", "女の子管理"]:
         try:
             res = page.evaluate(
@@ -434,7 +457,6 @@ def main():
                         )
                         continue
 
-                    # (残りいいね数, 表示文字列) のリストとして保持し、最後に降順ソートする
                     remaining_casts = []
                     completed_count = 0
 
@@ -454,7 +476,6 @@ def main():
                                 except Exception:
                                     pass
 
-                            # 名前から絵文字を除去
                             clean_name = clean_cast_name(cast["name"])
 
                             if blog_url is None:
@@ -464,7 +485,6 @@ def main():
                             print(f"[{shop_name}] {clean_name} -> 残りイイネ: {remaining}", flush=True)
 
                             if remaining == 0:
-                                # 100いいね完了したキャストは表示せず、完了数のみカウント
                                 completed_count += 1
                             elif remaining > 0:
                                 remaining_casts.append((remaining, f"・{clean_name}：残り {remaining}"))
@@ -475,7 +495,6 @@ def main():
                             print(f"キャスト確認エラー ({clean_name}): {cast_err}", flush=True)
                             remaining_casts.append((-1, f"・{clean_name}：確認中エラー"))
 
-                    # 残りいいね数が多い順（降順）に並び替え
                     remaining_casts.sort(key=lambda x: x[0], reverse=True)
 
                     report_lines.append(f"\n■ {shop_name}（在籍{len(active_casts)}名 / 完了{completed_count}名）")
