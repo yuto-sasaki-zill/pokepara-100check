@@ -503,4 +503,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-check_pokepara_likes_v7.py を表示しています。
