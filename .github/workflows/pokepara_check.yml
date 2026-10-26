@@ -2,8 +2,8 @@ name: Pokepara 100 Likes Check
 
 on:
   schedule:
-    # 毎日 22:30 (日本時間 JST) に自動実行（UTCでは 13:30）
-    - cron: '30 13 * * *'
+    # 毎日 22:15 (日本時間 JST) に自動実行（UTCでは 13:30）
+    - cron: '15 13 * * *'
   workflow_dispatch: # GitHub画面からいつでも手動実行も可能
 
 jobs:
