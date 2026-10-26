@@ -1,3 +1,7 @@
+
+check_pokepara_likes_v7.py
+
+100%
 import os
 import re
 import sys
@@ -22,6 +26,16 @@ TARGET_SHOPS = [
 ]
 
 JST = timezone(timedelta(hours=9))
+
+
+def clean_cast_name(name: str) -> str:
+    """キャスト名から絵文字・記号・異体字セレクタ等をすべて除去する"""
+    cleaned = re.sub(
+        r"[^\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\u3400-\u4DBFー々a-zA-Z0-9ａ-ｚＡ-Ｚ０-９]",
+        "",
+        name,
+    )
+    return cleaned.strip() or name.strip()
 
 
 def send_line_message(text: str) -> None:
@@ -141,7 +155,7 @@ def resolve_hokkaido_blog_url(page) -> str:
     if safe_goto(page, DEFAULT_HOKKAIDO_BLOG_URL, timeout=20000):
         try:
             body_text = page.locator("body").inner_text(timeout=5000)
-            if "本日の残り" in body_text:
+            if "本日の残り" in body_text or "上限超過" in body_text:
                 return DEFAULT_HOKKAIDO_BLOG_URL
         except Exception:
             pass
@@ -162,11 +176,14 @@ def resolve_hokkaido_blog_url(page) -> str:
 
 
 def extract_remaining_likes(page, blog_url: str) -> int:
+    """ブログ記事ページから『本日の残りイイネ』の数値を抽出する（『イイネ上限超過中。』は残り0＝完了として扱う）"""
     if not safe_goto(page, blog_url, timeout=20000):
         return -1
     page.wait_for_timeout(300)
     try:
         text = page.locator("body").inner_text(timeout=5000)
+        if "上限超過" in text:
+            return 0
         match = re.search(r"本日の残り(?:イイネ|いいね)\s*[:：]?\s*(\d+)", text)
         if match:
             return int(match.group(1))
@@ -176,11 +193,10 @@ def extract_remaining_likes(page, blog_url: str) -> int:
 
 
 def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
-    """非表示要素のクリック待機エラー（element is not visible）を防ぐため、すべてJavaScriptまたはURL直接遷移で店舗を切り替える"""
+    """非表示要素のクリック待機エラーを防ぐため、すべてJavaScriptまたはURL直接遷移で店舗を切り替える"""
     try:
         res = page.evaluate(
             """(keyword) => {
-            // 1. <select> による店舗切り替え
             const selects = Array.from(document.querySelectorAll("select"));
             for (const sel of selects) {
                 const options = Array.from(sel.options);
@@ -198,7 +214,6 @@ def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
                 }
             }
 
-            // 2. <a> リンクによる店舗切り替え（非表示メニュー内でも href を直接取得または JS click）
             const links = Array.from(document.querySelectorAll("a"));
             const shopLink = links.find(a => a.textContent && a.textContent.includes(keyword));
             if (shopLink) {
@@ -227,7 +242,7 @@ def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
 
 
 def navigate_to_cast_list(page) -> str:
-    """非表示サブメニューの .click() タイムアウトを防ぐため、href を直接取得して『女の子一覧』へ遷移する"""
+    """href を直接取得して『女の子一覧』へ遷移する"""
     for label in ["女の子一覧", "女の子管理"]:
         try:
             res = page.evaluate(
@@ -236,7 +251,6 @@ def navigate_to_cast_list(page) -> str:
                     a => a.textContent && a.textContent.includes(targetLabel)
                 );
                 if (links.length === 0) return { found: false };
-                // href が実URLのものを優先
                 const urlLink = links.find(a => a.href && !a.href.toLowerCase().startsWith("javascript:") && !a.getAttribute("href")?.startsWith("#"));
                 if (urlLink) {
                     return { found: true, type: "url", href: urlLink.href };
@@ -253,7 +267,6 @@ def navigate_to_cast_list(page) -> str:
                     page.wait_for_timeout(1000)
                 else:
                     page.wait_for_timeout(1500)
-                # すでに『女の子一覧』に到達して『代理ログイン』リンクが存在すれば完了
                 has_proxy = page.evaluate(
                     """() => Array.from(document.querySelectorAll("a")).some(a => a.textContent && a.textContent.includes("代理ログイン"))"""
                 )
@@ -391,7 +404,7 @@ def main():
         sys.exit(1)
 
     now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
-    report_lines = [f"【ポケパラ 100いいね未完了チェック v4】\n確認日時: {now_str}"]
+    report_lines = [f"【ポケパラ 100いいね未完了チェック】\n確認日時: {now_str}"]
 
     try:
         with sync_playwright() as p:
@@ -425,13 +438,15 @@ def main():
                         )
                         continue
 
+                    # (残りいいね数, 表示文字列) のリストとして保持し、最後に降順ソートする
                     remaining_casts = []
                     completed_count = 0
 
                     for cast in active_casts:
                         try:
                             if not safe_goto(page, cast["href"], timeout=20000):
-                                remaining_casts.append(f"・{cast['name']}：通信タイムアウト")
+                                clean_name = clean_cast_name(cast["name"])
+                                remaining_casts.append((-1, f"・{clean_name}：通信タイムアウト"))
                                 continue
 
                             if cast["name"] == "キャスト":
@@ -443,25 +458,33 @@ def main():
                                 except Exception:
                                     pass
 
+                            # 名前から絵文字を除去
+                            clean_name = clean_cast_name(cast["name"])
+
                             if blog_url is None:
                                 blog_url = resolve_hokkaido_blog_url(page)
 
                             remaining = extract_remaining_likes(page, blog_url)
-                            print(f"[{shop_name}] {cast['name']} -> 残りイイネ: {remaining}", flush=True)
+                            print(f"[{shop_name}] {clean_name} -> 残りイイネ: {remaining}", flush=True)
 
                             if remaining == 0:
+                                # 100いいね完了したキャストは表示せず、完了数のみカウント
                                 completed_count += 1
                             elif remaining > 0:
-                                remaining_casts.append(f"・{cast['name']}：残り {remaining}")
+                                remaining_casts.append((remaining, f"・{clean_name}：残り {remaining}"))
                             else:
-                                remaining_casts.append(f"・{cast['name']}：取得失敗（要確認）")
+                                remaining_casts.append((-1, f"・{clean_name}：取得失敗（要確認）"))
                         except Exception as cast_err:
-                            print(f"キャスト確認エラー ({cast.get('name')}): {cast_err}", flush=True)
-                            remaining_casts.append(f"・{cast.get('name', '不明')}：確認中エラー")
+                            clean_name = clean_cast_name(cast.get("name", "不明"))
+                            print(f"キャスト確認エラー ({clean_name}): {cast_err}", flush=True)
+                            remaining_casts.append((-1, f"・{clean_name}：確認中エラー"))
+
+                    # 残りいいね数が多い順（降順）に並び替え
+                    remaining_casts.sort(key=lambda x: x[0], reverse=True)
 
                     report_lines.append(f"\n■ {shop_name}（在籍{len(active_casts)}名 / 完了{completed_count}名）")
                     if remaining_casts:
-                        report_lines.extend(remaining_casts)
+                        report_lines.extend([line for _, line in remaining_casts])
                     else:
                         report_lines.append("🎉 全員100いいね完了（残り0）！")
                 except Exception as shop_err:
@@ -480,3 +503,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+check_pokepara_likes_v7.py を表示しています。
