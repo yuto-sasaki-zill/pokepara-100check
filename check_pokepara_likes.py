@@ -1,7 +1,3 @@
-
-check_pokepara_likes_v7.py
-
-100%
 import os
 import re
 import sys
