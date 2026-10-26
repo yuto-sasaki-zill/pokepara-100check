@@ -40,16 +40,31 @@ def send_line_message(text: str) -> None:
         "to": LINE_TO_ID,
         "messages": [{"type": "text", "text": text[:4999]}],
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    if resp.status_code != 200:
-        print(f"LINE送信エラー ({resp.status_code}): {resp.text}", file=sys.stderr, flush=True)
-    else:
-        print("LINE通知を正常に送信しました。", flush=True)
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        if resp.status_code != 200:
+            print(f"LINE送信エラー ({resp.status_code}): {resp.text}", file=sys.stderr, flush=True)
+        else:
+            print("LINE通知を正常に送信しました。", flush=True)
+    except Exception as e:
+        print(f"LINE送信例外エラー: {e}", file=sys.stderr, flush=True)
+
+
+def safe_goto(page, url: str, timeout: int = 25000) -> bool:
+    """通信遅延でも止まらない安全なページ遷移（リトライ付き）"""
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return True
+        except Exception as e:
+            print(f"ページ遷移リトライ ({attempt + 1}/2) URL={url}: {e}", flush=True)
+            page.wait_for_timeout(1000)
+    return False
 
 
 def login_to_pokepara(page) -> dict:
     """ポケパラ九州版の店舗ログイン画面でログインする"""
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    safe_goto(page, LOGIN_URL, timeout=30000)
     page.wait_for_timeout(1500)
 
     filled = page.evaluate(
@@ -111,7 +126,10 @@ def login_to_pokepara(page) -> dict:
     }""",
         {"loginId": POKEPARA_ID, "password": POKEPARA_PASSWORD},
     )
-    page.wait_for_load_state("domcontentloaded", timeout=30000)
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=25000)
+    except Exception:
+        pass
     page.wait_for_timeout(2000)
     filled["afterUrl"] = page.url
     filled["afterTitle"] = page.title()
@@ -120,82 +138,129 @@ def login_to_pokepara(page) -> dict:
 
 
 def resolve_hokkaido_blog_url(page) -> str:
-    page.goto(DEFAULT_HOKKAIDO_BLOG_URL, wait_until="domcontentloaded", timeout=30000)
-    body_text = page.locator("body").inner_text()
-    if "本日の残り" in body_text:
-        return DEFAULT_HOKKAIDO_BLOG_URL
+    if safe_goto(page, DEFAULT_HOKKAIDO_BLOG_URL, timeout=20000):
+        try:
+            body_text = page.locator("body").inner_text(timeout=5000)
+            if "本日の残り" in body_text:
+                return DEFAULT_HOKKAIDO_BLOG_URL
+        except Exception:
+            pass
 
-    page.goto("https://www.pokepara.jp/_hokkaido/", wait_until="domcontentloaded", timeout=30000)
-    blog_links = page.locator("a[href*='/blog/diary_']")
-    if blog_links.count() > 0:
-        href = blog_links.first.get_attribute("href")
-        if href:
-            return href if href.startswith("http") else f"https://www.pokepara.jp{href}"
+    if safe_goto(page, "https://www.pokepara.jp/_hokkaido/", timeout=20000):
+        try:
+            href = page.evaluate(
+                """() => {
+                const a = document.querySelector("a[href*='/blog/diary_']");
+                return a ? a.href : "";
+            }"""
+            )
+            if href:
+                return href
+        except Exception:
+            pass
     return DEFAULT_HOKKAIDO_BLOG_URL
 
 
 def extract_remaining_likes(page, blog_url: str) -> int:
-    page.goto(blog_url, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(500)
-    text = page.locator("body").inner_text()
-    match = re.search(r"本日の残り(?:イイネ|いいね)\s*[:：]?\s*(\d+)", text)
-    if match:
-        return int(match.group(1))
+    if not safe_goto(page, blog_url, timeout=20000):
+        return -1
+    page.wait_for_timeout(300)
+    try:
+        text = page.locator("body").inner_text(timeout=5000)
+        match = re.search(r"本日の残り(?:イイネ|いいね)\s*[:：]?\s*(\d+)", text)
+        if match:
+            return int(match.group(1))
+    except Exception as e:
+        print(f"残りイイネ抽出エラー: {e}", flush=True)
     return -1
 
 
 def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
-    switched_via_select = page.evaluate(
-        """(keyword) => {
-        const selects = Array.from(document.querySelectorAll("select"));
-        for (const sel of selects) {
-            const options = Array.from(sel.options);
-            const targetOpt = options.find(o => o.textContent.includes(keyword));
-            if (targetOpt) {
-                if (sel.value === targetOpt.value) {
-                    return { status: "already_selected" };
+    """非表示要素のクリック待機エラー（element is not visible）を防ぐため、すべてJavaScriptまたはURL直接遷移で店舗を切り替える"""
+    try:
+        res = page.evaluate(
+            """(keyword) => {
+            // 1. <select> による店舗切り替え
+            const selects = Array.from(document.querySelectorAll("select"));
+            for (const sel of selects) {
+                const options = Array.from(sel.options);
+                const targetOpt = options.find(o => o.textContent && o.textContent.includes(keyword));
+                if (targetOpt) {
+                    if (sel.value === targetOpt.value) {
+                        return { status: "already_selected", text: targetOpt.textContent.trim() };
+                    }
+                    sel.value = targetOpt.value;
+                    sel.dispatchEvent(new Event("change", { bubbles: true }));
+                    if (sel.onchange) {
+                        try { sel.onchange(); } catch (e) {}
+                    }
+                    return { status: "changed_select", text: targetOpt.textContent.trim() };
                 }
-                sel.value = targetOpt.value;
-                sel.dispatchEvent(new Event("change", { bubbles: true }));
-                return { status: "changed_select" };
             }
-        }
-        return { status: "no_select_found" };
-    }""",
-        target_shop_keyword,
-    )
-    if switched_via_select.get("status") == "changed_select":
-        page.wait_for_load_state("domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1500)
-        return
-    if switched_via_select.get("status") == "already_selected":
-        return
 
-    other_shop_btn = page.get_by_text("他のお店", exact=False)
-    if other_shop_btn.count() > 0:
-        other_shop_btn.first.click()
-        page.wait_for_timeout(800)
-
-    shop_link = page.locator("a", has_text=target_shop_keyword)
-    if shop_link.count() > 0:
-        shop_link.first.click()
-        page.wait_for_load_state("domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1500)
+            // 2. <a> リンクによる店舗切り替え（非表示メニュー内でも href を直接取得または JS click）
+            const links = Array.from(document.querySelectorAll("a"));
+            const shopLink = links.find(a => a.textContent && a.textContent.includes(keyword));
+            if (shopLink) {
+                if (shopLink.href && !shopLink.href.toLowerCase().startsWith("javascript:")) {
+                    return { status: "goto_url", url: shopLink.href, text: shopLink.textContent.trim() };
+                }
+                shopLink.click();
+                return { status: "js_clicked", text: shopLink.textContent.trim() };
+            }
+            return { status: "not_found" };
+        }""",
+            target_shop_keyword,
+        )
+        print(f"店舗切替 ({target_shop_keyword}): {res}", flush=True)
+        if res.get("status") == "goto_url" and res.get("url"):
+            safe_goto(page, res["url"], timeout=20000)
+            page.wait_for_timeout(1200)
+        elif res.get("status") in ("changed_select", "js_clicked"):
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+    except Exception as e:
+        print(f"店舗切替警告 ({target_shop_keyword}): {e}", flush=True)
 
 
 def navigate_to_cast_list(page) -> str:
+    """非表示サブメニューの .click() タイムアウトを防ぐため、href を直接取得して『女の子一覧』へ遷移する"""
     for label in ["女の子一覧", "女の子管理"]:
-        links = page.locator("a", has_text=label)
-        if links.count() > 0:
-            links.first.click()
-            page.wait_for_load_state("domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1500)
-
-    gal_list = page.locator("a", has_text="女の子一覧")
-    if gal_list.count() > 0:
-        gal_list.first.click()
-        page.wait_for_load_state("domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1500)
+        try:
+            res = page.evaluate(
+                """(targetLabel) => {
+                const links = Array.from(document.querySelectorAll("a")).filter(
+                    a => a.textContent && a.textContent.includes(targetLabel)
+                );
+                if (links.length === 0) return { found: false };
+                // href が実URLのものを優先
+                const urlLink = links.find(a => a.href && !a.href.toLowerCase().startsWith("javascript:") && !a.getAttribute("href")?.startsWith("#"));
+                if (urlLink) {
+                    return { found: true, type: "url", href: urlLink.href };
+                }
+                links[0].click();
+                return { found: true, type: "js_click" };
+            }""",
+                label,
+            )
+            print(f"メニュー検索 ({label}): {res}", flush=True)
+            if res.get("found"):
+                if res.get("type") == "url" and res.get("href"):
+                    safe_goto(page, res["href"], timeout=20000)
+                    page.wait_for_timeout(1000)
+                else:
+                    page.wait_for_timeout(1500)
+                # すでに『女の子一覧』に到達して『代理ログイン』リンクが存在すれば完了
+                has_proxy = page.evaluate(
+                    """() => Array.from(document.querySelectorAll("a")).some(a => a.textContent && a.textContent.includes("代理ログイン"))"""
+                )
+                if has_proxy:
+                    break
+        except Exception as e:
+            print(f"メニュー遷移警告 ({label}): {e}", flush=True)
 
     return page.url
 
@@ -203,15 +268,18 @@ def navigate_to_cast_list(page) -> str:
 def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str, dict]:
     casts_list_url = navigate_to_cast_list(page)
 
-    page.evaluate(
-        """() => {
-        const triggers = Array.from(document.querySelectorAll("a, span, div, button")).filter(
-            el => el.textContent && el.textContent.includes("その他の項目")
-        );
-        triggers.forEach(t => { try { t.click(); } catch (e) {} });
-    }"""
-    )
-    page.wait_for_timeout(500)
+    try:
+        page.evaluate(
+            """() => {
+            const triggers = Array.from(document.querySelectorAll("a, span, div, button")).filter(
+                el => el.textContent && el.textContent.includes("その他の項目")
+            );
+            triggers.forEach(t => { try { t.click(); } catch (e) {} });
+        }"""
+        )
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
 
     info = page.evaluate(
         """() => {
@@ -299,11 +367,6 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str, dict]:
             }
         }
 
-        const sampleLinks = Array.from(document.querySelectorAll("a"))
-            .map(a => (a.textContent || "").trim())
-            .filter(Boolean)
-            .slice(0, 15);
-
         return {
             url: location.href,
             title: document.title,
@@ -311,10 +374,13 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str, dict]:
             activeCount: activeResults.length,
             skippedGray: skippedGray,
             activeResults: activeResults,
-            sampleLinks: sampleLinks,
             bodySnippet: (document.body ? document.body.innerText : "").replace(/\\s+/g, " ").slice(0, 150)
         };
     }"""
+    )
+    print(
+        f"一覧取得: URL={info['url']} / 総数={info['totalProxyLinks']} / 在籍={info['activeCount']} / スキップ={len(info['skippedGray'])}",
+        flush=True,
     )
     return info["activeResults"], casts_list_url, info
 
@@ -325,71 +391,87 @@ def main():
         sys.exit(1)
 
     now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
-    report_lines = [f"【ポケパラ 100いいね未完了チェック v2】\n確認日時: {now_str}"]
+    report_lines = [f"【ポケパラ 100いいね未完了チェック v4】\n確認日時: {now_str}"]
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 900},
-            locale="ja-JP",
-        )
-        page = context.new_page()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+                locale="ja-JP",
+            )
+            page = context.new_page()
 
-        login_info = login_to_pokepara(page)
-        admin_home_url = page.url
-        blog_url = None
-
-        for shop_name in TARGET_SHOPS:
-            page.goto(admin_home_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1000)
-            switch_shop_if_needed(page, shop_name)
+            login_to_pokepara(page)
             admin_home_url = page.url
+            blog_url = None
 
-            active_casts, casts_list_url, debug_info = get_active_casts_and_proxy_urls(page)
-            if not active_casts:
-                report_lines.append(
-                    f"\n■ {shop_name}\n⚠️ 在籍キャスト取得0名\n"
-                    f"・URL: {debug_info.get('url')}\n"
-                    f"・Title: {debug_info.get('title')}\n"
-                    f"・代理ログイン検出数: {debug_info.get('totalProxyLinks')} (グレースキップ: {len(debug_info.get('skippedGray', []))})\n"
-                    f"・画面抜粋: {debug_info.get('bodySnippet')}"
-                )
-                continue
+            for shop_name in TARGET_SHOPS:
+                try:
+                    safe_goto(page, admin_home_url, timeout=25000)
+                    page.wait_for_timeout(800)
+                    switch_shop_if_needed(page, shop_name)
+                    admin_home_url = page.url
 
-            remaining_casts = []
-            completed_count = 0
+                    active_casts, casts_list_url, debug_info = get_active_casts_and_proxy_urls(page)
+                    if not active_casts:
+                        report_lines.append(
+                            f"\n■ {shop_name}\n⚠️ 在籍キャスト取得0名\n"
+                            f"・URL: {debug_info.get('url')}\n"
+                            f"・Title: {debug_info.get('title')}\n"
+                            f"・代理ログイン検出数: {debug_info.get('totalProxyLinks')}\n"
+                            f"・画面抜粋: {debug_info.get('bodySnippet')}"
+                        )
+                        continue
 
-            for cast in active_casts:
-                page.goto(cast["href"], wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(500)
+                    remaining_casts = []
+                    completed_count = 0
 
-                if cast["name"] == "キャスト":
-                    mypage_text = page.locator("body").inner_text()
-                    m_name = re.search(r"([^\s\n]+)\s*さん", mypage_text)
-                    if m_name:
-                        cast["name"] = m_name.group(1)
+                    for cast in active_casts:
+                        try:
+                            if not safe_goto(page, cast["href"], timeout=20000):
+                                remaining_casts.append(f"・{cast['name']}：通信タイムアウト")
+                                continue
 
-                if blog_url is None:
-                    blog_url = resolve_hokkaido_blog_url(page)
+                            if cast["name"] == "キャスト":
+                                try:
+                                    mypage_text = page.locator("body").inner_text(timeout=5000)
+                                    m_name = re.search(r"([^\s\n]+)\s*さん", mypage_text)
+                                    if m_name:
+                                        cast["name"] = m_name.group(1)
+                                except Exception:
+                                    pass
 
-                remaining = extract_remaining_likes(page, blog_url)
-                if remaining == 0:
-                    completed_count += 1
-                elif remaining > 0:
-                    remaining_casts.append(f"・{cast['name']}：残り {remaining}")
-                else:
-                    remaining_casts.append(f"・{cast['name']}：取得失敗（要確認）")
+                            if blog_url is None:
+                                blog_url = resolve_hokkaido_blog_url(page)
 
-                page.goto(casts_list_url, wait_until="domcontentloaded", timeout=30000)
+                            remaining = extract_remaining_likes(page, blog_url)
+                            print(f"[{shop_name}] {cast['name']} -> 残りイイネ: {remaining}", flush=True)
 
-            report_lines.append(f"\n■ {shop_name}（在籍{len(active_casts)}名 / 完了{completed_count}名）")
-            if remaining_casts:
-                report_lines.extend(remaining_casts)
-            else:
-                report_lines.append("🎉 全員100いいね完了（残り0）！")
+                            if remaining == 0:
+                                completed_count += 1
+                            elif remaining > 0:
+                                remaining_casts.append(f"・{cast['name']}：残り {remaining}")
+                            else:
+                                remaining_casts.append(f"・{cast['name']}：取得失敗（要確認）")
+                        except Exception as cast_err:
+                            print(f"キャスト確認エラー ({cast.get('name')}): {cast_err}", flush=True)
+                            remaining_casts.append(f"・{cast.get('name', '不明')}：確認中エラー")
 
-        browser.close()
+                    report_lines.append(f"\n■ {shop_name}（在籍{len(active_casts)}名 / 完了{completed_count}名）")
+                    if remaining_casts:
+                        report_lines.extend(remaining_casts)
+                    else:
+                        report_lines.append("🎉 全員100いいね完了（残り0）！")
+                except Exception as shop_err:
+                    print(f"店舗処理エラー ({shop_name}): {shop_err}", flush=True)
+                    report_lines.append(f"\n■ {shop_name}\n⚠️ 店舗処理中エラー: {shop_err}")
+
+            browser.close()
+    except Exception as fatal_err:
+        print(f"全体エラー: {fatal_err}", flush=True)
+        report_lines.append(f"\n⚠️ 実行中エラー: {fatal_err}")
 
     final_message = "\n".join(report_lines)
     print("\n--- 最終レポート ---\n" + final_message, flush=True)
