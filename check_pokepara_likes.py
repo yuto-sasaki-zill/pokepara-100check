@@ -47,33 +47,37 @@ def send_line_message(text: str) -> None:
         print("LINE通知を正常に送信しました。", flush=True)
 
 
-def login_to_pokepara(page) -> bool:
-    """ポケパラ九州版の店舗ログイン画面でログインする（ヘッダー検索窓を誤入力しないようパスワード欄基準で特定）"""
-    print(f"ログイン画面へアクセス中: {LOGIN_URL}", flush=True)
+def login_to_pokepara(page) -> dict:
+    """ポケパラ九州版の店舗ログイン画面でログインする"""
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(1500)
 
-    # パスワード入力欄を含むフォーム、またはパスワード欄の直前のテキスト入力欄を特定
     filled = page.evaluate(
         """({ loginId, password }) => {
         const passInput = document.querySelector("input[type='password']");
-        if (!passInput) return { ok: false, reason: "password input not found" };
+        if (!passInput) {
+            return {
+                ok: false,
+                reason: "password_input_not_found",
+                title: document.title,
+                bodySnippet: (document.body ? document.body.innerText : "").slice(0, 200)
+            };
+        }
 
         const form = passInput.closest("form") || document.body;
         const inputs = Array.from(form.querySelectorAll("input"));
         const passIdx = inputs.indexOf(passInput);
 
-        // パスワード欄より前にあるテキスト系inputを逆順に探す
         let idInput = null;
         for (let i = passIdx - 1; i >= 0; i--) {
             const inp = inputs[i];
             const t = (inp.type || "text").toLowerCase();
-            if (["text", "tel", "email", "number"].includes(t) && inp.offsetParent !== null) {
+            if (["text", "tel", "email", "number"].includes(t)) {
                 idInput = inp;
                 break;
             }
         }
-        if (!idInput) return { ok: false, reason: "id input not found before password" };
+        if (!idInput) return { ok: false, reason: "id_input_not_found" };
 
         idInput.focus();
         idInput.value = loginId;
@@ -85,7 +89,6 @@ def login_to_pokepara(page) -> bool:
         passInput.dispatchEvent(new Event("input", { bubbles: true }));
         passInput.dispatchEvent(new Event("change", { bubbles: true }));
 
-        // パスワード欄より後にある送信ボタンを探す
         let submitBtn = null;
         for (let i = passIdx + 1; i < inputs.length; i++) {
             const inp = inputs[i];
@@ -103,20 +106,20 @@ def login_to_pokepara(page) -> bool:
             return { ok: true, idName: idInput.name || idInput.id, passName: passInput.name || passInput.id };
         } else {
             form.submit();
-            return { ok: true, idName: idInput.name || idInput.id, passName: passInput.name || passInput.id, submittedForm: true };
+            return { ok: true, submittedForm: true };
         }
     }""",
         {"loginId": POKEPARA_ID, "password": POKEPARA_PASSWORD},
     )
-    print(f"ログインフォーム入力結果: {filled}", flush=True)
     page.wait_for_load_state("domcontentloaded", timeout=30000)
     page.wait_for_timeout(2000)
-    print(f"ログイン後のURL: {page.url} / タイトル: {page.title()}", flush=True)
-    return "login_shopc" not in page.url.lower()
+    filled["afterUrl"] = page.url
+    filled["afterTitle"] = page.title()
+    print(f"ログイン結果: {filled}", flush=True)
+    return filled
 
 
 def resolve_hokkaido_blog_url(page) -> str:
-    """確認用の北海道ブログ記事URLを取得する"""
     page.goto(DEFAULT_HOKKAIDO_BLOG_URL, wait_until="domcontentloaded", timeout=30000)
     body_text = page.locator("body").inner_text()
     if "本日の残り" in body_text:
@@ -132,7 +135,6 @@ def resolve_hokkaido_blog_url(page) -> str:
 
 
 def extract_remaining_likes(page, blog_url: str) -> int:
-    """ブログ記事ページから『本日の残りイイネ』の数値を抽出する"""
     page.goto(blog_url, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(500)
     text = page.locator("body").inner_text()
@@ -143,9 +145,6 @@ def extract_remaining_likes(page, blog_url: str) -> int:
 
 
 def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
-    """管理画面左上の『他のお店でログインする』から対象店舗へ切り替える"""
-    print(f"店舗切り替え確認中: {target_shop_keyword}", flush=True)
-    # 1. <select> ドロップダウンがある場合
     switched_via_select = page.evaluate(
         """(keyword) => {
         const selects = Array.from(document.querySelectorAll("select"));
@@ -154,18 +153,17 @@ def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
             const targetOpt = options.find(o => o.textContent.includes(keyword));
             if (targetOpt) {
                 if (sel.value === targetOpt.value) {
-                    return { status: "already_selected", text: targetOpt.textContent.trim() };
+                    return { status: "already_selected" };
                 }
                 sel.value = targetOpt.value;
                 sel.dispatchEvent(new Event("change", { bubbles: true }));
-                return { status: "changed_select", text: targetOpt.textContent.trim() };
+                return { status: "changed_select" };
             }
         }
         return { status: "no_select_found" };
     }""",
         target_shop_keyword,
     )
-    print(f"セレクトボックス切替結果: {switched_via_select}", flush=True)
     if switched_via_select.get("status") == "changed_select":
         page.wait_for_load_state("domcontentloaded", timeout=30000)
         page.wait_for_timeout(1500)
@@ -173,51 +171,38 @@ def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
     if switched_via_select.get("status") == "already_selected":
         return
 
-    # 2. 『他のお店でログインする』クリック展開型の場合
     other_shop_btn = page.get_by_text("他のお店", exact=False)
     if other_shop_btn.count() > 0:
         other_shop_btn.first.click()
         page.wait_for_timeout(800)
 
-    shop_link = page.locator("a, option, li, div", has_text=target_shop_keyword)
-    for i in range(shop_link.count()):
-        el = shop_link.nth(i)
-        tag = el.evaluate("el => el.tagName.toLowerCase()")
-        if tag == "a":
-            el.click()
-            page.wait_for_load_state("domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1500)
-            print(f"リンククリックで店舗切替完了: {page.url}", flush=True)
-            return
+    shop_link = page.locator("a", has_text=target_shop_keyword)
+    if shop_link.count() > 0:
+        shop_link.first.click()
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+        page.wait_for_timeout(1500)
 
 
 def navigate_to_cast_list(page) -> str:
-    """『女の子管理』＞『女の子一覧』ページへ遷移する"""
     for label in ["女の子一覧", "女の子管理"]:
         links = page.locator("a", has_text=label)
         if links.count() > 0:
-            href = links.first.get_attribute("href")
-            print(f"メニュー『{label}』を検出 (href={href})、遷移します", flush=True)
             links.first.click()
             page.wait_for_load_state("domcontentloaded", timeout=30000)
             page.wait_for_timeout(1500)
 
-    # もし遷移後にまだ『女の子一覧』リンクがあればクリック
     gal_list = page.locator("a", has_text="女の子一覧")
     if gal_list.count() > 0:
         gal_list.first.click()
         page.wait_for_load_state("domcontentloaded", timeout=30000)
         page.wait_for_timeout(1500)
 
-    print(f"女の子一覧ページURL: {page.url}", flush=True)
     return page.url
 
 
-def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str]:
-    """『女の子一覧』ページから、背景がグレーでない在籍キャスト名と代理ログインURLを取得する"""
+def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str, dict]:
     casts_list_url = navigate_to_cast_list(page)
 
-    # 『その他の項目»』をすべて展開して代理ログインリンクを確実に表示させる
     page.evaluate(
         """() => {
         const triggers = Array.from(document.querySelectorAll("a, span, div, button")).filter(
@@ -238,19 +223,17 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str]:
         const skippedGray = [];
 
         for (const link of allProxyLinks) {
-            // このリンク1つだけを含む最上位のキャストカード要素（個別枠）を特定する
             let card = link.parentElement;
             while (card && card.parentElement && card.parentElement !== document.body) {
                 const parentProxyCount = Array.from(card.parentElement.querySelectorAll("a")).filter(
                     a => a.textContent && a.textContent.includes("代理ログイン")
                 ).length;
                 if (parentProxyCount > 1) {
-                    break; // 親要素が複数キャストを含む一覧コンテナに達したらストップ
+                    break;
                 }
                 card = card.parentElement;
             }
 
-            // link から card までの要素のみを対象にグレー背景（非在籍）かどうかを判定
             let curr = link;
             let isGray = false;
             while (curr) {
@@ -278,7 +261,6 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str]:
                 const rgbMatch = bg.match(/rgb\\((\\d+),\\s*(\\d+),\\s*(\\d+)\\)/);
                 if (rgbMatch) {
                     const [_, r, g, b] = rgbMatch.map(Number);
-                    // 白(255,255,255)ではなく、グレー系(R=G=Bかつ150〜245)の背景色がカード自体についている場合
                     if (Math.abs(r - g) <= 5 && Math.abs(g - b) <= 5 && r >= 150 && r <= 245) {
                         isGray = true;
                     }
@@ -287,7 +269,6 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str]:
                 curr = curr.parentElement;
             }
 
-            // キャスト名の抽出（カード内の不要なボタン文字列を除いた先頭テキストまたは見出し）
             let castName = "";
             if (card) {
                 const ignoreWords = [
@@ -317,19 +298,25 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str]:
                 activeResults.push(item);
             }
         }
+
+        const sampleLinks = Array.from(document.querySelectorAll("a"))
+            .map(a => (a.textContent || "").trim())
+            .filter(Boolean)
+            .slice(0, 15);
+
         return {
+            url: location.href,
+            title: document.title,
             totalProxyLinks: allProxyLinks.length,
             activeCount: activeResults.length,
             skippedGray: skippedGray,
-            activeResults: activeResults
+            activeResults: activeResults,
+            sampleLinks: sampleLinks,
+            bodySnippet: (document.body ? document.body.innerText : "").replace(/\\s+/g, " ").slice(0, 150)
         };
     }"""
     )
-    print(
-        f"代理ログイン総数: {info['totalProxyLinks']} / 在籍: {info['activeCount']} / スキップ(グレー): {len(info['skippedGray'])} ({info['skippedGray']})",
-        flush=True,
-    )
-    return info["activeResults"], casts_list_url
+    return info["activeResults"], casts_list_url, info
 
 
 def main():
@@ -338,31 +325,36 @@ def main():
         sys.exit(1)
 
     now_str = datetime.now(JST).strftime("%Y/%m/%d %H:%M")
-    report_lines = [f"【ポケパラ 100いいね未完了チェック】\n確認日時: {now_str}"]
+    report_lines = [f"【ポケパラ 100いいね未完了チェック v2】\n確認日時: {now_str}"]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 900},
+            locale="ja-JP",
+        )
         page = context.new_page()
 
-        # 1. ログイン
-        login_ok = login_to_pokepara(page)
-        if not login_ok:
-            print("警告: ログイン画面から遷移していない可能性があります。URL:", page.url, flush=True)
-
+        login_info = login_to_pokepara(page)
         admin_home_url = page.url
         blog_url = None
 
-        # 2. 各店舗を順番に確認
         for shop_name in TARGET_SHOPS:
             page.goto(admin_home_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(1000)
             switch_shop_if_needed(page, shop_name)
             admin_home_url = page.url
 
-            active_casts, casts_list_url = get_active_casts_and_proxy_urls(page)
+            active_casts, casts_list_url, debug_info = get_active_casts_and_proxy_urls(page)
             if not active_casts:
-                report_lines.append(f"\n■ {shop_name}\n⚠️ 在籍キャスト一覧を取得できませんでした（0名）")
+                report_lines.append(
+                    f"\n■ {shop_name}\n⚠️ 在籍キャスト取得0名\n"
+                    f"・URL: {debug_info.get('url')}\n"
+                    f"・Title: {debug_info.get('title')}\n"
+                    f"・代理ログイン検出数: {debug_info.get('totalProxyLinks')} (グレースキップ: {len(debug_info.get('skippedGray', []))})\n"
+                    f"・画面抜粋: {debug_info.get('bodySnippet')}"
+                )
                 continue
 
             remaining_casts = []
@@ -372,7 +364,6 @@ def main():
                 page.goto(cast["href"], wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(500)
 
-                # 代理ログイン後のマイページ上にキャスト名があれば補完
                 if cast["name"] == "キャスト":
                     mypage_text = page.locator("body").inner_text()
                     m_name = re.search(r"([^\s\n]+)\s*さん", mypage_text)
@@ -383,8 +374,6 @@ def main():
                     blog_url = resolve_hokkaido_blog_url(page)
 
                 remaining = extract_remaining_likes(page, blog_url)
-                print(f"[{shop_name}] {cast['name']} -> 残りイイネ: {remaining}", flush=True)
-
                 if remaining == 0:
                     completed_count += 1
                 elif remaining > 0:
