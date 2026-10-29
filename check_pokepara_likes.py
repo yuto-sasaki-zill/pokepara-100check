@@ -24,6 +24,15 @@ TARGET_SHOPS = [
 
 JST = timezone(timedelta(hours=9))
 
+# 100いいね完了（上限到達）を示す判定キーワード一覧
+COMPLETED_KEYWORDS = [
+    "上限超過",
+    "超えています",
+    "上限回数",
+    "イイネできません",
+    "いいねできません",
+]
+
 
 def clean_cast_name(name: str) -> str:
     """キャスト名から絵文字・記号・異体字セレクタ等をすべて除去する"""
@@ -43,7 +52,6 @@ def send_line_message(text: str) -> None:
 
     messages_payload = [{"type": "text", "text": text[:4999]}]
 
-    # LINE_TO_ID が未設定または BROADCAST の場合は友だち全員に一斉送信
     if not LINE_TO_ID or LINE_TO_ID.upper() == "BROADCAST":
         url = "https://api.line.me/v2/bot/message/broadcast"
         headers = {
@@ -61,7 +69,6 @@ def send_line_message(text: str) -> None:
             print(f"LINE送信例外エラー: {e}", file=sys.stderr, flush=True)
         return
 
-    # カンマまたは改行・空白区切りで複数の送信先IDに対応
     target_ids = [tid.strip() for tid in re.split(r"[,\s]+", LINE_TO_ID) if tid.strip()]
     for tid in target_ids:
         url = "https://api.line.me/v2/bot/message/push"
@@ -84,7 +91,7 @@ def send_line_message(text: str) -> None:
             print(f"LINE送信例外エラー (宛先={tid}): {e}", file=sys.stderr, flush=True)
 
 
-def safe_goto(page, url: str, timeout: int = 25000) -> bool:
+def safe_goto(page, url: str, timeout: int = 15000) -> bool:
     """通信遅延でも止まらない安全なページ遷移（リトライ付き）"""
     for attempt in range(2):
         try:
@@ -92,14 +99,14 @@ def safe_goto(page, url: str, timeout: int = 25000) -> bool:
             return True
         except Exception as e:
             print(f"ページ遷移リトライ ({attempt + 1}/2) URL={url}: {e}", flush=True)
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(500)
     return False
 
 
 def login_to_pokepara(page) -> dict:
     """ポケパラ九州版の店舗ログイン画面でログインする"""
-    safe_goto(page, LOGIN_URL, timeout=30000)
-    page.wait_for_timeout(1500)
+    safe_goto(page, LOGIN_URL, timeout=25000)
+    page.wait_for_timeout(1000)
 
     filled = page.evaluate(
         """({ loginId, password }) => {
@@ -161,10 +168,10 @@ def login_to_pokepara(page) -> dict:
         {"loginId": POKEPARA_ID, "password": POKEPARA_PASSWORD},
     )
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=25000)
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
     except Exception:
         pass
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1200)
     filled["afterUrl"] = page.url
     filled["afterTitle"] = page.title()
     print(f"ログイン結果: {filled}", flush=True)
@@ -172,15 +179,15 @@ def login_to_pokepara(page) -> dict:
 
 
 def resolve_hokkaido_blog_url(page) -> str:
-    if safe_goto(page, DEFAULT_HOKKAIDO_BLOG_URL, timeout=20000):
+    if safe_goto(page, DEFAULT_HOKKAIDO_BLOG_URL, timeout=15000):
         try:
             body_text = page.locator("body").inner_text(timeout=5000)
-            if "本日の残り" in body_text or "上限超過" in body_text:
+            if "本日の残り" in body_text or any(kw in body_text for kw in COMPLETED_KEYWORDS):
                 return DEFAULT_HOKKAIDO_BLOG_URL
         except Exception:
             pass
 
-    if safe_goto(page, "https://www.pokepara.jp/_hokkaido/", timeout=20000):
+    if safe_goto(page, "https://www.pokepara.jp/_hokkaido/", timeout=15000):
         try:
             href = page.evaluate(
                 """() => {
@@ -196,13 +203,13 @@ def resolve_hokkaido_blog_url(page) -> str:
 
 
 def extract_remaining_likes(page, blog_url: str) -> int:
-    """ブログ記事ページから『本日の残りイイネ』の数値を抽出する（『イイネ上限超過中。』は残り0＝完了として扱う）"""
-    if not safe_goto(page, blog_url, timeout=20000):
+    """ブログ記事ページから『本日の残りイイネ』の数値を抽出する（『1日のイイネ上限回数100回を超えています』等は残り0＝完了として扱う）"""
+    if not safe_goto(page, blog_url, timeout=15000):
         return -1
-    page.wait_for_timeout(300)
     try:
         text = page.locator("body").inner_text(timeout=5000)
-        if "上限超過" in text:
+        # 上限到達（100いいね完了）の各種表記パターンを検知
+        if any(kw in text for kw in COMPLETED_KEYWORDS):
             return 0
         match = re.search(r"本日の残り(?:イイネ|いいね)\s*[:：]?\s*(\d+)", text)
         if match:
@@ -248,14 +255,14 @@ def switch_shop_if_needed(page, target_shop_keyword: str) -> None:
         )
         print(f"店舗切替 ({target_shop_keyword}): {res}", flush=True)
         if res.get("status") == "goto_url" and res.get("url"):
-            safe_goto(page, res["url"], timeout=20000)
-            page.wait_for_timeout(1200)
+            safe_goto(page, res["url"], timeout=15000)
+            page.wait_for_timeout(800)
         elif res.get("status") in ("changed_select", "js_clicked"):
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
             except Exception:
                 pass
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1000)
     except Exception as e:
         print(f"店舗切替警告 ({target_shop_keyword}): {e}", flush=True)
 
@@ -281,10 +288,10 @@ def navigate_to_cast_list(page) -> str:
             print(f"メニュー検索 ({label}): {res}", flush=True)
             if res.get("found"):
                 if res.get("type") == "url" and res.get("href"):
-                    safe_goto(page, res["href"], timeout=20000)
-                    page.wait_for_timeout(1000)
+                    safe_goto(page, res["href"], timeout=15000)
+                    page.wait_for_timeout(600)
                 else:
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(1000)
                 has_proxy = page.evaluate(
                     """() => Array.from(document.querySelectorAll("a")).some(a => a.textContent && a.textContent.includes("代理ログイン"))"""
                 )
@@ -308,7 +315,7 @@ def get_active_casts_and_proxy_urls(page) -> tuple[list[dict], str, dict]:
             triggers.forEach(t => { try { t.click(); } catch (e) {} });
         }"""
         )
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(300)
     except Exception:
         pass
 
@@ -432,6 +439,13 @@ def main():
                 viewport={"width": 1280, "height": 900},
                 locale="ja-JP",
             )
+            # 高速化：不要な画像・動画・フォントのダウンロードをすべて遮断（文字と背景色CSSのみ取得）
+            context.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font")
+                else route.continue_(),
+            )
             page = context.new_page()
 
             login_to_pokepara(page)
@@ -440,8 +454,8 @@ def main():
 
             for shop_name in TARGET_SHOPS:
                 try:
-                    safe_goto(page, admin_home_url, timeout=25000)
-                    page.wait_for_timeout(800)
+                    safe_goto(page, admin_home_url, timeout=20000)
+                    page.wait_for_timeout(500)
                     switch_shop_if_needed(page, shop_name)
                     admin_home_url = page.url
 
@@ -456,19 +470,20 @@ def main():
                         )
                         continue
 
+                    # (残りいいね数, 表示文字列) のリストとして保持し、最後に降順ソートする
                     remaining_casts = []
                     completed_count = 0
 
                     for cast in active_casts:
                         try:
-                            if not safe_goto(page, cast["href"], timeout=20000):
+                            if not safe_goto(page, cast["href"], timeout=15000):
                                 clean_name = clean_cast_name(cast["name"])
                                 remaining_casts.append((-1, f"・{clean_name}：通信タイムアウト"))
                                 continue
 
                             if cast["name"] == "キャスト":
                                 try:
-                                    mypage_text = page.locator("body").inner_text(timeout=5000)
+                                    mypage_text = page.locator("body").inner_text(timeout=3000)
                                     m_name = re.search(r"([^\s\n]+)\s*さん", mypage_text)
                                     if m_name:
                                         cast["name"] = m_name.group(1)
@@ -484,6 +499,7 @@ def main():
                             print(f"[{shop_name}] {clean_name} -> 残りイイネ: {remaining}", flush=True)
 
                             if remaining == 0:
+                                # 100いいね完了したキャストは表示せず、完了数のみカウント
                                 completed_count += 1
                             elif remaining > 0:
                                 remaining_casts.append((remaining, f"・{clean_name}：残り {remaining}"))
